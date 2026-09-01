@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 import os
@@ -99,6 +100,9 @@ MAX_QUESTIONS = 20
 
 GEMINI_MODEL = "gemini-3.6-flash"
 
+# Retry only temporary Gemini availability errors.
+MAX_EVALUATION_RETRIES = 3
+
 
 # =========================================================
 # ROOT ENDPOINT
@@ -106,6 +110,7 @@ GEMINI_MODEL = "gemini-3.6-flash"
 
 @app.get("/")
 async def root():
+
     return {
         "status": "success",
         "message": "InterviewAI backend is running",
@@ -120,6 +125,7 @@ async def root():
 
 @app.get("/health")
 async def health():
+
     return {
         "status": "healthy",
         "gemini_configured": bool(GEMINI_API_KEY),
@@ -134,6 +140,7 @@ def clean_text(value: Any) -> str:
     """
     Safely convert a value to trimmed text.
     """
+
     if value is None:
         return ""
 
@@ -162,6 +169,7 @@ def clamp_score(value: Any) -> int:
             )
 
         else:
+
             value = float(value)
 
         return round(
@@ -174,7 +182,10 @@ def clamp_score(value: Any) -> int:
             )
         )
 
-    except (TypeError, ValueError):
+    except (
+        TypeError,
+        ValueError
+    ):
 
         return 0
 
@@ -354,7 +365,7 @@ def clean_json_response(
     object_match = re.search(
         r"\{.*\}",
         text,
-        flags=re.DOTALL,
+        flags=re.DOTALL
     )
 
     if object_match:
@@ -382,22 +393,34 @@ def clean_json_response(
 # GENERATE AI INTERVIEW
 # =========================================================
 
-@app.post("/api/generate-interview")
+@app.post(
+    "/api/generate-interview"
+)
 async def generate_interview(
+
     resume: UploadFile = File(...),
+
     role: str = Form(...),
+
     experience: str = Form(...),
+
     interview_type: str = Form(...),
+
     difficulty: str = Form(...),
+
     question_count: int = Form(...),
+
     job_description: str = Form(...),
+
 ):
 
     # =====================================================
     # VALIDATION
     # =====================================================
 
-    role = clean_text(role)
+    role = clean_text(
+        role
+    )
 
     experience = clean_text(
         experience
@@ -588,6 +611,8 @@ Use exactly this format:
 
             config=types.GenerateContentConfig(
 
+                temperature=0.7,
+
                 max_output_tokens=5000,
 
                 response_mime_type="application/json",
@@ -607,7 +632,7 @@ Use exactly this format:
             status_code=500,
             detail=(
                 "Gemini API request failed. "
-                "Please check your API key and try again."
+                "Please try again."
             ),
         )
 
@@ -684,6 +709,7 @@ Use exactly this format:
             item,
             dict,
         ):
+
             continue
 
         normalized_questions.append(
@@ -783,7 +809,9 @@ Use exactly this format:
 # EVALUATE COMPLETED INTERVIEW
 # =========================================================
 
-@app.post("/api/evaluate-interview")
+@app.post(
+    "/api/evaluate-interview"
+)
 async def evaluate_interview(
 
     role: str = Form(...),
@@ -873,7 +901,8 @@ async def evaluate_interview(
         raise HTTPException(
             status_code=400,
             detail=(
-                "Questions or answers contain invalid JSON."
+                "Questions or answers contain "
+                "invalid JSON."
             ),
         )
 
@@ -906,7 +935,8 @@ async def evaluate_interview(
         raise HTTPException(
             status_code=400,
             detail=(
-                "At least one interview question is required."
+                "At least one interview question "
+                "is required."
             ),
         )
 
@@ -924,6 +954,7 @@ async def evaluate_interview(
             question,
             dict,
         ):
+
             continue
 
         question_text = clean_text(
@@ -977,7 +1008,6 @@ async def evaluate_interview(
             )
 
         interview_content.append(
-
             {
                 "question_number":
                     index + 1,
@@ -999,7 +1029,6 @@ async def evaluate_interview(
                         :MAX_ANSWER_LENGTH
                     ],
             }
-
         )
 
     if not interview_content:
@@ -1150,39 +1179,160 @@ For unanswered questions:
 """
 
     # =====================================================
-    # GEMINI REQUEST
+    # GEMINI EVALUATION REQUEST WITH RETRY
     # =====================================================
 
-    try:
+    response_text = None
 
-        response = client.models.generate_content(
+    for attempt in range(
+        1,
+        MAX_EVALUATION_RETRIES + 1
+    ):
 
-            model=GEMINI_MODEL,
+        try:
 
-            contents=prompt,
+            print(
+                f"Starting Gemini evaluation attempt "
+                f"{attempt}/{MAX_EVALUATION_RETRIES}..."
+            )
 
-            config=types.GenerateContentConfig(
+            response = client.models.generate_content(
 
-                max_output_tokens=8000,
+                model=GEMINI_MODEL,
 
-                response_mime_type="application/json",
-            ),
-        )
+                contents=prompt,
 
-        response_text = response.text
+                config=types.GenerateContentConfig(
 
-    except Exception as error:
+                    temperature=0.4,
 
-        print(
-            "Gemini evaluation error:",
-            error,
-        )
+                    max_output_tokens=8000,
+
+                    response_mime_type="application/json",
+                ),
+            )
+
+            response_text = response.text
+
+            print(
+                f"Gemini evaluation succeeded on "
+                f"attempt {attempt}."
+            )
+
+            break
+
+        except Exception as error:
+
+            error_text = str(
+                error
+            )
+
+            error_upper = error_text.upper()
+
+            print(
+                f"Gemini evaluation attempt "
+                f"{attempt} failed:"
+            )
+
+            print(
+                error_text
+            )
+
+            # -------------------------------------------------
+            # TEMPORARY 503 / UNAVAILABLE
+            # -------------------------------------------------
+
+            is_unavailable = (
+                "503" in error_text
+                or "UNAVAILABLE" in error_upper
+                or "SERVICE UNAVAILABLE" in error_upper
+            )
+
+            if is_unavailable:
+
+                if attempt < MAX_EVALUATION_RETRIES:
+
+                    retry_delay = 2 ** attempt
+
+                    print(
+                        "Gemini model is temporarily "
+                        "unavailable because of high demand."
+                    )
+
+                    print(
+                        f"Retrying in "
+                        f"{retry_delay} seconds..."
+                    )
+
+                    await asyncio.sleep(
+                        retry_delay
+                    )
+
+                    continue
+
+                print(
+                    "Gemini evaluation failed after "
+                    "all retry attempts."
+                )
+
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Gemini is temporarily unavailable "
+                        "because the model is experiencing "
+                        "high demand. Please try again shortly."
+                    ),
+                )
+
+            # -------------------------------------------------
+            # 429 QUOTA / RATE LIMIT
+            # -------------------------------------------------
+
+            is_quota_error = (
+                "429" in error_text
+                or "RESOURCE_EXHAUSTED" in error_upper
+                or "QUOTA" in error_upper
+                or "RATE LIMIT" in error_upper
+            )
+
+            if is_quota_error:
+
+                print(
+                    "Gemini API quota or rate limit "
+                    "has been reached."
+                )
+
+                raise HTTPException(
+                    status_code=429,
+                    detail=(
+                        "Gemini API usage limit has been "
+                        "reached. Please try again later."
+                    ),
+                )
+
+            # -------------------------------------------------
+            # OTHER GEMINI ERRORS
+            # -------------------------------------------------
+
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Gemini evaluation failed. "
+                    "Please try again."
+                ),
+            )
+
+    # =====================================================
+    # SAFETY CHECK
+    # =====================================================
+
+    if not response_text:
 
         raise HTTPException(
-            status_code=500,
+            status_code=503,
             detail=(
-                "Gemini evaluation failed. "
-                "Please check the backend and API key."
+                "Gemini did not return an evaluation. "
+                "Please try again shortly."
             ),
         )
 
@@ -1401,6 +1551,7 @@ For unanswered questions:
             item,
             dict,
         ):
+
             continue
 
         ideal_points = item.get(
@@ -1481,6 +1632,7 @@ For unanswered questions:
                     if clean_text(point)
 
                 ],
+
             }
 
         )
@@ -1499,17 +1651,22 @@ For unanswered questions:
 
         "candidate": {
 
-            "role": role,
+            "role":
+                role,
 
-            "experience": experience,
+            "experience":
+                experience,
 
-            "interview_type": interview_type,
+            "interview_type":
+                interview_type,
 
-            "difficulty": difficulty,
+            "difficulty":
+                difficulty,
 
         },
 
-        "evaluation": evaluation,
+        "evaluation":
+            evaluation,
 
     }
 
